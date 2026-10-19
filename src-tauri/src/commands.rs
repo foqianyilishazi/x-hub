@@ -2615,7 +2615,11 @@ pub struct DroppedAppInfo {
     pub icon: Option<String>,
 }
 
-/// 解析拖入的文件信息：.exe 直接读取，.lnk 快捷方式解析其目标路径；均尝试提取程序图标
+/// 解析拖入的文件信息：
+/// - Windows：.exe 直接读取，.lnk 快捷方式解析其目标路径
+/// - macOS：.app 包直接读取；可执行文件（含 shebang 的 CLI 工具）视为应用；
+///   Finder 替身（alias）先解析到原始目标
+/// 均尝试提取程序图标
 #[tauri::command]
 pub fn parse_dropped_path(path: String) -> Result<DroppedAppInfo, String> {
     let p = std::path::Path::new(&path);
@@ -2624,29 +2628,33 @@ pub fn parse_dropped_path(path: String) -> Result<DroppedAppInfo, String> {
         .and_then(|e| e.to_str())
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
-    let (name, target, icon) = match ext.as_str() {
-        "exe" => {
-            let name = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("本地应用")
-                .to_string();
-            let target = path.clone();
-            let icon = extract_app_icon(&target);
-            (name, target, icon)
-        }
-        "lnk" => {
-            let name = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("快捷方式")
-                .to_string();
-            let (target, icon) = resolve_lnk_target_and_icon(&path)?;
-            (name, target, icon)
-        }
-        _ => {
-            log::warn!("拖入文件不支持: {}", path);
-            return Err("仅支持 .exe 文件或 .lnk 快捷方式".into());
+    let (name, target, icon) = if cfg!(target_os = "macos") {
+        parse_dropped_mac(&path)?
+    } else {
+        match ext.as_str() {
+            "exe" => {
+                let name = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("本地应用")
+                    .to_string();
+                let target = path.clone();
+                let icon = extract_app_icon(&target);
+                (name, target, icon)
+            }
+            "lnk" => {
+                let name = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("快捷方式")
+                    .to_string();
+                let (target, icon) = resolve_lnk_target_and_icon(&path)?;
+                (name, target, icon)
+            }
+            _ => {
+                log::warn!("拖入文件不支持: {}", path);
+                return Err("仅支持 .exe 文件或 .lnk 快捷方式".into());
+            }
         }
     };
     log::info!("拖入解析成功: {} -> {} (图标: {})", name, target, if icon.is_some() { "有" } else { "无" });
@@ -2655,6 +2663,63 @@ pub fn parse_dropped_path(path: String) -> Result<DroppedAppInfo, String> {
         target,
         icon,
     })
+}
+
+/// macOS 拖入解析：.app 包 / 可执行文件 / Finder 替身（解析到原始目标后再按前两类处理）
+#[cfg(target_os = "macos")]
+fn parse_dropped_mac(path: &str) -> Result<(String, String, Option<String>), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Finder 替身：尝试解析到原始目标（NSURL 资源解析）
+    let resolved = resolve_alias_target(path);
+    let target = resolved.clone().unwrap_or_else(|| path.to_string());
+    let p = std::path::Path::new(&target);
+
+    if p.is_dir() && target.ends_with(".app") {
+        let name = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("本地应用")
+            .to_string();
+        let icon = extract_app_icon(&target);
+        return Ok((name, target, icon));
+    }
+    if p.is_file() {
+        let is_exec = std::fs::metadata(p)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if is_exec {
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("本地应用")
+                .to_string();
+            let icon = extract_app_icon(&target);
+            return Ok((name, target, icon));
+        }
+    }
+    log::warn!("拖入文件不支持: {path}");
+    Err("仅支持 .app 应用或可执行文件（从「应用程序」文件夹拖入最稳）".into())
+}
+
+/// 解析 Finder 替身（alias）到原始目标路径：非替身/解析失败返回 None。
+/// 用 osascript 问 Finder（避免手写 alias 二进制格式解析）。
+#[cfg(target_os = "macos")]
+fn resolve_alias_target(path: &str) -> Option<String> {
+    use crate::process::NoConsoleWindow;
+    let script = format!(
+        "tell application \"System Events\" to get POSIX path of (original item of (file \"{}\" as alias))",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let mut cmd = std::process::Command::new("osascript");
+    cmd.arg("-e").arg(&script);
+    cmd.no_console_window();
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 /// 创建隐藏窗口的 powershell 命令：避免 GUI 应用调用时弹出黑色控制台窗口
@@ -3015,7 +3080,71 @@ pub async fn scan_installed_apps() -> Result<Vec<InstalledAppInfo>, String> {
 ///
 /// 已不再扫注册表卸载项（2026-09-30 按需求去掉）：卸载项常把 DisplayIcon 指向
 /// 卸载器/维护程序，图标与名称噪音大。只保留开始菜单 `.lnk`（用户真正点得到的东西）。
+/// 扫描候选来源：
+/// - Windows：开始菜单快捷方式（用户 + 公共，见下方 PowerShell 脚本）
+/// - macOS：/Applications、/System/Applications、~/Applications 下的 .app 包
 fn scan_app_candidates() -> Result<Vec<(String, String)>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return scan_app_candidates_mac();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        scan_app_candidates_windows()
+    }
+}
+
+/// macOS 应用扫描：一层 .app 枚举（不进包内部），过滤卸载器/系统工具噪音，
+/// 名称取 Info.plist（CFBundleDisplayName / CFBundleName）兜底包名。
+#[cfg(target_os = "macos")]
+fn scan_app_candidates_mac() -> Result<Vec<(String, String)>, String> {
+    let mut dirs: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("/Applications"),
+        std::path::PathBuf::from("/System/Applications"),
+        std::path::PathBuf::from("/System/Applications/Utilities"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    let mut apps: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(bundle) = name.strip_suffix(".app") else {
+                continue;
+            };
+            let path = e.path();
+            if !path.join("Contents/MacOS").is_dir() {
+                continue;
+            }
+            // 噪音过滤：卸载器/安装器与系统壳工具（与 Windows 过滤口径对应）
+            let lower = bundle.to_lowercase();
+            if lower.starts_with("uninstall") || lower.contains("uninstaller") {
+                continue;
+            }
+            let key = path.to_string_lossy().to_lowercase();
+            if !seen.insert(key) {
+                continue;
+            }
+            let display = crate::browsers::bundle_display_name_for_scan(&path)
+                .unwrap_or_else(|| bundle.to_string());
+            apps.push((display, path.to_string_lossy().into_owned()));
+        }
+    }
+    apps.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    const MAX_APPS: usize = 500;
+    if apps.len() > MAX_APPS {
+        apps.truncate(MAX_APPS);
+    }
+    Ok(apps)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scan_app_candidates_windows() -> Result<Vec<(String, String)>, String> {
     let script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -3240,6 +3369,107 @@ pub async fn scan_desktop() -> Result<Vec<DesktopEntry>, String> {
 /// Rust 侧解析、二次去重、排序、限量。名称/路径取值一律在 PS 内 Trim，中文经 UTF-8 输出。
 /// `src` = 该条目对应的桌面快捷方式原始路径（仅 `.lnk`/`.url` 非空），供「导入后清理」用。
 fn scan_desktop_candidates() -> Result<Vec<(String, String, String, Option<String>)>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return scan_desktop_candidates_mac();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        scan_desktop_candidates_windows()
+    }
+}
+
+/// macOS 桌面扫描（一层）：
+/// - 文件夹 → folder；.app → app；.webloc（Safari/Chrome 拖出的网页快捷方式）→ web
+/// - 其它文件 → file；Finder 替身解析到原始目标再分类（src = 替身路径，供导入后清理）
+#[cfg(target_os = "macos")]
+fn scan_desktop_candidates_mac() -> Result<Vec<(String, String, String, Option<String>)>, String> {
+    let Some(desktop) = dirs::desktop_dir() else {
+        return Ok(vec![]);
+    };
+    let mut out: Vec<(String, String, String, Option<String>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(&desktop) else {
+        return Ok(vec![]);
+    };
+    for e in entries.flatten() {
+        let file_name = e.file_name().to_string_lossy().into_owned();
+        let full = e.path();
+        // .webloc → 读 URL（XML plist：<key>URL</key><string>https://...</string>）
+        if file_name.ends_with(".webloc") {
+            if let Some(url) = read_webloc_url(&full) {
+                let name = file_name.trim_end_matches(".webloc").to_string();
+                let key = url.to_lowercase();
+                if seen.insert(key) {
+                    out.push((name, url, "web".into(), Some(full.to_string_lossy().into_owned())));
+                }
+            }
+            continue;
+        }
+        // 替身解析：解析成功按目标分类（src = 替身），失败按自身形态分类（src = None）
+        let (target, src, is_alias) = match resolve_alias_target(&full.to_string_lossy()) {
+            Some(t) if t != full.to_string_lossy() => (
+                t,
+                Some(full.to_string_lossy().into_owned()),
+                true,
+            ),
+            _ => (full.to_string_lossy().into_owned(), None, false),
+        };
+        let tp = std::path::Path::new(&target);
+        if !tp.exists() {
+            continue;
+        }
+        let name = file_name.trim_end_matches(".app").to_string();
+        let kind = if tp.is_dir() {
+            if target.ends_with(".app") {
+                "app"
+            } else {
+                "folder"
+            }
+        } else {
+            "file"
+        };
+        // 非 .app 的替身指向文件（如 .exe/.lnk 语义在 mac 不存在）一律按 file 处理
+        let key = target.to_lowercase();
+        if seen.insert(key) {
+            let _ = is_alias;
+            out.push((name, target, kind.into(), src));
+        }
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    const MAX_ENTRIES: usize = 200;
+    if out.len() > MAX_ENTRIES {
+        out.truncate(MAX_ENTRIES);
+    }
+    Ok(out)
+}
+
+/// 读 .webloc 里的 URL（XML plist 文本扫描）
+#[cfg(target_os = "macos")]
+fn read_webloc_url(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines = content.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line == "<key>URL</key>" {
+            if let Some(next) = lines.next() {
+                if let Some(v) = next
+                    .strip_prefix("<string>")
+                    .and_then(|s| s.strip_suffix("</string>"))
+                {
+                    let v = v.trim();
+                    if v.starts_with("http://") || v.starts_with("https://") {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scan_desktop_candidates_windows() -> Result<Vec<(String, String, String, Option<String>)>, String> {
     let script = r#"
 $ErrorActionPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -3466,12 +3696,21 @@ pub fn scan_browser_bookmarks(dedupe: bool) -> Result<BrowserBookmarkScan, Strin
             truncated: 0,
         });
     };
-    // (展示名, User Data 相对路径)；均为 Chromium 系，Bookmarks 结构一致
+    // (展示名, User Data 相对路径)；均为 Chromium 系，Bookmarks 结构一致。
+    // 路径分隔符随平台：Windows 在 %LOCALAPPDATA%，macOS 在 ~/Library/Application Support
+    #[cfg(target_os = "windows")]
     let vendors: [(&str, &str); 4] = [
         ("Chrome", r"Google\Chrome\User Data"),
         ("Edge", r"Microsoft\Edge\User Data"),
         ("Brave", r"BraveSoftware\Brave-Browser\User Data"),
         ("Chromium", r"Chromium\User Data"),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let vendors: [(&str, &str); 4] = [
+        ("Chrome", "Google/Chrome/User Data"),
+        ("Edge", "Microsoft/Edge/User Data"),
+        ("Brave", "BraveSoftware/Brave-Browser/User Data"),
+        ("Chromium", "Chromium/User Data"),
     ];
 
     let mut found: Vec<BrowserBookmark> = Vec::new();

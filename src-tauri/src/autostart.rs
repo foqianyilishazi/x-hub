@@ -4,7 +4,9 @@
 //! 管理员权限进程无法从资源管理器接收文件拖放（速达拖拽导入失效），该模式已移除。
 //! `apply` 时会顺带清理旧版残留的计划任务。
 
+#[cfg(target_os = "windows")]
 use crate::process::NoConsoleWindow;
+#[cfg(target_os = "windows")]
 use std::process::Command;
 
 /// 自启动在命令行里追加的隐藏启动参数（主窗不弹出、直接驻留托盘）
@@ -135,7 +137,14 @@ pub fn probe() -> (bool, bool) {
     (run_path_matches_current(), is_os_disabled())
 }
 
-#[cfg(not(target_os = "windows"))]
+/// macOS：LaunchAgents plist 存在且 ProgramArguments 指向当前二进制。
+/// macOS 无 StartupApproved 等价的系统级禁用标记，os_disabled 恒 false。
+#[cfg(target_os = "macos")]
+pub fn probe() -> (bool, bool) {
+    (launch_agent_matches_current(), false)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn probe() -> (bool, bool) {
     (false, false)
 }
@@ -158,8 +167,19 @@ pub fn ensure_registered() -> Result<bool, String> {
     Ok(false)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn ensure_registered() -> Result<bool, String> {
+    Ok(false)
+}
+
+/// macOS 自启动自愈：LaunchAgent 缺失或路径不符时按当前二进制重写
+#[cfg(target_os = "macos")]
+pub fn ensure_registered() -> Result<bool, String> {
+    if !launch_agent_matches_current() {
+        write_launch_agent()?;
+        log::info!("[自启动] 自愈：LaunchAgent 缺失或路径不符，已按当前二进制重写");
+        return Ok(true);
+    }
     Ok(false)
 }
 
@@ -236,12 +256,143 @@ pub fn apply(enabled: bool) -> Result<(), String> {
         }
         Ok(())
     }
-    // 非 Windows 平台：自启动仅支持当前平台时返回错误提示
-    #[cfg(not(target_os = "windows"))]
+    // macOS：LaunchAgents（登录时拉起，与 Run 键同语义）
+    #[cfg(target_os = "macos")]
+    {
+        remove_launch_agent();
+        if enabled {
+            write_launch_agent()?;
+        }
+        Ok(())
+    }
+    // 其余平台：自启动仅支持当前平台时返回错误提示
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = enabled;
         Err("当前平台不支持开机自启动".into())
     }
+}
+
+// ---------- macOS：LaunchAgents ----------
+
+/// LaunchAgent 标签与 plist 路径
+#[cfg(target_os = "macos")]
+const LA_LABEL: &str = "x-hub.autostart";
+
+#[cfg(target_os = "macos")]
+fn launch_agent_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join("Library/LaunchAgents/x-hub.plist"))
+}
+
+/// 当前二进制完整路径（.app 内层二进制，LaunchAgent 直接拉它即等效双击启动）
+#[cfg(target_os = "macos")]
+fn exe_path_mac() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// 写入 LaunchAgent plist：RunAtLoad + --autostart-hidden（登录即静默驻留托盘）
+#[cfg(target_os = "macos")]
+fn write_launch_agent() -> Result<(), String> {
+    use std::io::Write as _;
+
+    let Some(path) = launch_agent_path() else {
+        return Err("无法定位用户 LaunchAgents 目录".into());
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建 LaunchAgents 目录失败: {e}"))?;
+    }
+    let exe = exe_path_mac();
+    if exe.is_empty() {
+        return Err("无法定位当前程序路径".into());
+    }
+    // XML 转义（路径可能含 & 等）
+    let esc = exe.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LA_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{esc}</string>
+        <string>{HIDDEN_ARG}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>AssociatedBundleIdentifiers</key>
+    <string>x-hub</string>
+</dict>
+</plist>
+"#
+    );
+    #[allow(unused_mut)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&path)
+            .map_err(|e| format!("写入 LaunchAgent 失败: {e}"))?
+    };
+    file.write_all(plist.as_bytes())
+        .map_err(|e| format!("写入 LaunchAgent 失败: {e}"))?;
+    // 通知 launchd 重新加载（失败不阻断：下次登录自然生效）
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", "-w"])
+        .arg(&path)
+        .status();
+    let _ = std::process::Command::new("launchctl")
+        .args(["load", "-w"])
+        .arg(&path)
+        .status();
+    log::info!("已写入开机自启动 LaunchAgent: {}", path.display());
+    Ok(())
+}
+
+/// 移除 LaunchAgent（unload + 删文件）
+#[cfg(target_os = "macos")]
+fn remove_launch_agent() {
+    use crate::process::NoConsoleWindow;
+    let Some(path) = launch_agent_path() else {
+        return;
+    };
+    if path.exists() {
+        let mut cmd = std::process::Command::new("launchctl");
+        cmd.args(["unload", "-w"]).arg(&path);
+        cmd.no_console_window();
+        let _ = cmd.status();
+        let _ = std::fs::remove_file(&path);
+        log::info!("已移除开机自启动 LaunchAgent");
+    }
+}
+
+/// LaunchAgent 是否存在且 ProgramArguments 指向当前二进制（路径大小写不敏感比对）
+#[cfg(target_os = "macos")]
+fn launch_agent_matches_current() -> bool {
+    let Some(path) = launch_agent_path() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let cur = exe_path_mac();
+    if cur.is_empty() {
+        return false;
+    }
+    // plist 的 ProgramArguments 首项即二进制路径（XML 转义还原）
+    let unesc = content
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    unesc
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(&format!("<string>{}</string>", cur)))
 }
 
 #[cfg(test)]

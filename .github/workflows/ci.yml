@@ -50,3 +50,34 @@ jobs:
       # 起不来（STATUS_ENTRYPOINT_NOT_FOUND），表现为「测试静默没跑」。
       - name: Rust tests
         run: npm run tauri:test
+
+  # macOS 检查（Apple Silicon）：cargo check/test 直跑（无 Common-Controls manifest 需求）
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Frontend type check & build
+        run: npm run build
+
+      - name: Rust check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml

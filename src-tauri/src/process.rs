@@ -39,6 +39,26 @@ pub fn launch_program(path: &str, args: Option<&str>) -> Result<(), String> {
         // CREATE_NO_WINDOW，Windows 会为子进程新建控制台窗口（闪黑窗）
         c.no_console_window();
         c
+    } else if target.is_dir() && path.ends_with(".app") {
+        // macOS 应用包：不能直接 exec 目录，交给 LaunchServices（open -a）
+        let mut c = Command::new("open");
+        c.arg("-a").arg(path);
+        if let Some(args) = args {
+            if !args.trim().is_empty() {
+                c.arg("--args");
+                for arg in split_args(args) {
+                    c.arg(arg);
+                }
+            }
+        }
+        return match c
+            .no_console_window()
+            .spawn()
+            .map(|_| ())
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(format!("启动程序失败「{}」: {}", path, e)),
+        };
     } else {
         #[cfg(target_os = "windows")]
         let mut c = Command::new("cmd");
@@ -51,7 +71,10 @@ pub fn launch_program(path: &str, args: Option<&str>) -> Result<(), String> {
         #[cfg(not(target_os = "windows"))]
         let mut c = Command::new("sh");
         #[cfg(not(target_os = "windows"))]
-        c.arg("-c").arg(path);
+        {
+            c.arg("-c").arg(path);
+            c.no_console_window();
+        }
         c
     };
     if let Some(args) = args {
@@ -64,6 +87,7 @@ pub fn launch_program(path: &str, args: Option<&str>) -> Result<(), String> {
     match cmd.spawn() {
         Ok(_) => Ok(()),
         // Windows 错误 740：程序需要管理员权限，自动请求 UAC 提权
+        #[cfg(target_os = "windows")]
         Err(e) if e.raw_os_error() == Some(740) => {
             log::warn!("程序需要管理员权限，请求 UAC 提权: {}", path);
             launch_elevated(path, args)
@@ -72,26 +96,61 @@ pub fn launch_program(path: &str, args: Option<&str>) -> Result<(), String> {
     }
 }
 
-/// 以管理员权限启动（触发 UAC 提权确认）：PowerShell Start-Process -Verb RunAs。
+/// 以管理员权限启动：
+/// - Windows：PowerShell Start-Process -Verb RunAs（触发 UAC 提权确认）。
+/// - macOS：osascript `do shell script ... with administrator privileges`
+///   （触发系统管理员密码授权弹窗）。
 /// 两条入口：launch_program 撞错误 740（程序清单要求提权）时的自动兜底，
 /// 与 launch_resource_as_admin（速达右键「以管理员身份运行」）的用户显式提权。
 pub(crate) fn launch_elevated(path: &str, args: Option<&str>) -> Result<(), String> {
-    let has_args = args.map(|a| !a.trim().is_empty()).unwrap_or(false);
-    let script = if has_args {
-        "Start-Process -FilePath $env:XHUB_PATH -ArgumentList $env:XHUB_ARGS -Verb RunAs"
-    } else {
-        "Start-Process -FilePath $env:XHUB_PATH -Verb RunAs"
-    };
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
-        .env("XHUB_PATH", path);
-    cmd.no_console_window();
-    if has_args {
-        cmd.env("XHUB_ARGS", args.unwrap_or(""));
+    #[cfg(target_os = "windows")]
+    {
+        let has_args = args.map(|a| !a.trim().is_empty()).unwrap_or(false);
+        let script = if has_args {
+            "Start-Process -FilePath $env:XHUB_PATH -ArgumentList $env:XHUB_ARGS -Verb RunAs"
+        } else {
+            "Start-Process -FilePath $env:XHUB_PATH -Verb RunAs"
+        };
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", script])
+            .env("XHUB_PATH", path);
+        cmd.no_console_window();
+        if has_args {
+            cmd.env("XHUB_ARGS", args.unwrap_or(""));
+        }
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("提权启动失败「{}」: {}", path, e))
     }
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("提权启动失败「{}」: {}", path, e))
+    #[cfg(target_os = "macos")]
+    {
+        // shell 引号转义：路径/参数里的 " 与 \ 按 POSIX 规则转义后拼进 osascript
+        let sh_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let mut cmdline = sh_quote(path);
+        if let Some(a) = args {
+            if !a.trim().is_empty() {
+                for arg in split_args(a) {
+                    cmdline.push(' ');
+                    cmdline.push_str(&sh_quote(&arg));
+                }
+            }
+        }
+        let script = format!(
+            "do shell script {} with administrator privileges",
+            sh_quote(&cmdline)
+        );
+        let mut cmd = Command::new("osascript");
+        cmd.arg("-e").arg(&script);
+        cmd.no_console_window();
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("提权启动失败「{}」: {}", path, e))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (path, args);
+        Err("当前平台不支持提权启动".into())
+    }
 }
 
 /// 引号感知的参数分割：`--dir "C:\My Apps"` 保持为一个参数
@@ -130,28 +189,53 @@ fn smb_url_to_unc(url: &str) -> Option<String> {
 pub fn open_url(url: &str) -> Result<(), String> {
     // smb://host/share/path → UNC \\host\share\path 交给资源管理器：Windows 不注册 smb:
     // 协议（ShellExecute 报「没有与之关联的应用」），网络共享的原生写法就是 UNC；
-    // ftp/ftps/sftp 系协议系统有处理器（浏览器/资源管理器），照常走 opener
+    // macOS 的 smb:// 由系统直接处理（Finder 连接共享），照常走 opener。
+    #[cfg(target_os = "windows")]
     if let Some(unc) = smb_url_to_unc(url) {
         return open_path(&unc);
     }
     opener::open(url).map_err(|e| format!("打开链接失败: {}", e))
 }
 
-/// 用指定浏览器打开 URL（browser_exe 必须存在；URL 仅放行 http/https，由调用方校验）
+/// 用指定浏览器打开 URL（browser 目标必须存在；URL 仅放行 http/https，由调用方校验）。
+/// macOS：目标是 .app 包时走 `open -a`（LaunchServices）；exe 二进制路径直接 spawn。
 pub fn open_with_browser(browser_exe: &str, url: &str) -> Result<(), String> {
-    let path = std::path::Path::new(browser_exe);
-    if !path.is_file() {
-        return Err(format!("浏览器不存在: {}", browser_exe));
-    }
     // 浏览器已经在运行：先把它的窗口调度到前台。主流浏览器收到 URL 会复用现有实例、
     // 以新标签页打开，这里再置前一次，避免用户以为「点了没反应」。
     let _ = activate_existing(browser_exe);
-    let mut cmd = Command::new(path);
-    cmd.arg(url);
-    cmd.no_console_window();
-    match cmd.spawn() {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("启动浏览器失败「{}」: {}", browser_exe, e)),
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::path::Path::new(browser_exe);
+        if !path.exists() {
+            return Err(format!("浏览器不存在: {}", browser_exe));
+        }
+        let mut cmd = if path.is_dir() && browser_exe.ends_with(".app") {
+            let mut c = Command::new("open");
+            c.arg("-a").arg(browser_exe).arg(url);
+            c
+        } else {
+            let mut c = Command::new(browser_exe);
+            c.arg(url);
+            c
+        };
+        cmd.no_console_window();
+        return cmd
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("启动浏览器失败「{}」: {}", browser_exe, e));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let path = std::path::Path::new(browser_exe);
+        if !path.is_file() {
+            return Err(format!("浏览器不存在: {}", browser_exe));
+        }
+        let mut cmd = Command::new(path);
+        cmd.arg(url);
+        cmd.no_console_window();
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| format!("启动浏览器失败「{}」: {}", browser_exe, e))
     }
 }
 
@@ -179,13 +263,12 @@ pub fn activate_existing(exe_path: &str) -> bool {
     }
 }
 
-/// 取可执行文件名（按进程名匹配用；输入可以是完整路径）
+/// 取可执行文件名（按进程名匹配用；输入可以是完整路径）。
+/// 同时按 `/` 与 `\` 分割：Windows 风格路径在非 Windows 平台也能取出文件名
+/// （进程名匹配对双平台路径都能命中）。
 fn exe_file_name(path: &str) -> Option<String> {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
+    let name = path.rsplit(['/', '\\']).next().unwrap_or("");
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -220,6 +303,7 @@ fn activate_existing_by_name(exe_name: &str) -> bool {
 /// 停留在隐藏前的最后一帧不再重绘（一片空白）；隐藏态还常并存带标题的大面积辅助窗
 /// （微信 `WxTrayIconMessageWindow`，实测 1440×753 比真主窗还大），打分极易选错。
 /// 隐藏态返回 false 让调用方重启 exe、走应用自带单实例的正规唤起路径（两例均实测通过）。
+#[cfg(target_os = "windows")]
 fn is_focus_candidate(visible: bool, title_len: i32, ex_style: u32, area: i64) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE;
     visible && title_len > 0 && ex_style & WS_EX_NOACTIVATE == 0 && area > 0
@@ -307,9 +391,51 @@ fn focus_windows_of(pids: &[u32]) -> bool {
     true
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn activate_existing_by_name(_exe_name: &str) -> bool {
     false
+}
+
+/// macOS：同名进程已在运行 → NSRunningApplication activate 调度到前台。
+///
+/// 与 Windows 语义一致点：命中同名进程并把它的应用激活即返回 true，
+/// 调用方跳过二次启动（LaunchServices 对 .app 本身也有单实例语义，双保险）。
+/// 差异点：macOS 没有「隐藏窗口不能拉」的坑（activate 走应用正规激活路径，
+/// 相当于 Dock 点击），故无需候选窗口打分。
+#[cfg(target_os = "macos")]
+fn activate_existing_by_name(exe_name: &str) -> bool {
+    use objc2_app_kit::NSRunningApplication;
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let self_pid = std::process::id();
+    let pids: Vec<u32> = sys
+        .processes()
+        .iter()
+        .filter(|(pid, p)| {
+            pid.as_u32() != self_pid
+                && p.name().to_string_lossy().eq_ignore_ascii_case(exe_name)
+        })
+        .map(|(pid, _)| pid.as_u32())
+        .collect();
+    if pids.is_empty() {
+        return false;
+    }
+    let mut activated = false;
+    for pid in pids {
+        if let Some(app) =
+            unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32) }
+        {
+            // ActivateIgnoringOtherApps 在 macOS 14+ 已弃用（无效果但无害），保留兼容旧系统
+            #[allow(deprecated)]
+            let opts = objc2_app_kit::NSApplicationActivationOptions::ActivateIgnoringOtherApps;
+            if unsafe { app.activateWithOptions(opts) } {
+                activated = true;
+            }
+        }
+    }
+    activated
 }
 
 /// 打开外部链接（仅供前端调用的安全命令：只放行 http/https，防止任意 scheme 注入）。
@@ -402,9 +528,27 @@ pub fn reveal_in_explorer(path: &str) -> Result<(), String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // 非 Windows 无「选中」等价语义：退回打开其所在目录
-        let dir = if target.is_dir() { target } else { target.parent().unwrap_or(target) };
-        opener::open(dir).map_err(|e| format!("打开所在文件夹失败: {}", e))
+        // macOS：`open -R` 与 explorer /select 等价——打开所在目录并把该项高亮选中；
+        // 其余非 Windows 平台无「选中」语义，退回打开所在目录
+        #[cfg(target_os = "macos")]
+        {
+            return Command::new("open")
+                .arg("-R")
+                .arg(target)
+                .no_console_window()
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("打开文件所在位置失败: {}", e));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let dir = if target.is_dir() {
+                target
+            } else {
+                target.parent().unwrap_or(target)
+            };
+            opener::open(dir).map_err(|e| format!("打开所在文件夹失败: {}", e))
+        }
     }
 }
 
@@ -422,17 +566,9 @@ mod tests {
 
     #[test]
     fn launch_nonexistent_program_returns_error() {
-        // Windows 上经 cmd /C 启动不存在路径时 cmd 进程本身可成功 spawn，
-        // 因此只对非 Windows 平台断言失败；Windows 断言不 panic 即可。
-        #[cfg(not(target_os = "windows"))]
-        {
-            let result = launch_program("/nonexistent/path/xyz", None);
-            assert!(result.is_err());
-        }
-        #[cfg(target_os = "windows")]
-        {
-            let _ = launch_program("/nonexistent/path/xyz", None);
-        }
+        // 命令行兜底路径（cmd /C、sh -c）spawn 本身可成功，「找不到命令」在子进程内
+        // 才暴露——Windows/macOS/Linux 一致，故各平台都只断言不 panic。
+        let _ = launch_program("/nonexistent/path/xyz", None);
     }
 
     #[test]
@@ -504,6 +640,7 @@ mod tests {
         assert!(!activate_existing("https://example.com"));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn focus_candidate_rejects_hidden_windows() {
         // 2026-09-29 微信 4.1.13「关窗挂托盘」态实测值（同一进程并存的窗口）：

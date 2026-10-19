@@ -96,3 +96,59 @@ jobs:
             ${{ steps.package.outputs.portable_zip_name }}
           draft: true
           prerelease: false
+
+  # macOS 发布（Apple Silicon）：.app + dmg（ad-hoc 签名——未配 Developer ID 时
+  # 本地可直接运行；正式分发需在 repo secrets 配 APPLE_CERTIFICATE 后改公证流程）
+  release-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build .app and dmg
+        run: npx tauri build --config src-tauri/tauri.macos.conf.json
+
+      # ad-hoc 重签（CI 产物无签名会被 LaunchServices 拒起；ad-hoc 签名本机可直接打开，
+      # 首次打开右键-打开或系统设置允许即可。正式分发请替换为 Developer ID + 公证）
+      - name: Ad-hoc codesign
+        run: |
+          codesign --force --deep -s - "src-tauri/target/release/bundle/macos/x-hub.app"
+          codesign --verify --deep --verbose=2 "src-tauri/target/release/bundle/macos/x-hub.app"
+
+      - name: Package
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dmg="src-tauri/target/release/bundle/dmg/x-hub_${version}_aarch64.dmg"
+          if [ ! -f "$dmg" ]; then
+            dmg=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          fi
+          cp "$dmg" "x-hub-$version-macos-aarch64.dmg"
+          echo "dmg_name=x-hub-$version-macos-aarch64.dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Upload macOS dmg
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: 'x-hub ${{ github.ref_name }}'
+          files: |
+            ${{ steps.package.outputs.dmg_name }}
+          draft: true
+          prerelease: false

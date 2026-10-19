@@ -10,6 +10,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-6.x-3178c6?logo=typescript&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-1.77+-dea584?logo=rust&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-local-003b57?logo=sqlite&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey)
 ![Version](https://img.shields.io/badge/version-0.9.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -92,6 +93,7 @@
 - Node.js 18+
 - Rust 1.77.2+（[rustup](https://rustup.rs/)）
 - Windows：WebView2（Win10/11 自带）
+- macOS：Xcode Command Line Tools（`xcode-select --install`），Apple Silicon（M1 及以上）
 
 ### 安装与运行
 
@@ -101,8 +103,42 @@ npm install
 npm run dev           # Vite 浏览器预览 (http://localhost:1420)
 npm run tauri:dev     # Tauri 桌面开发窗口
 npm run build         # vue-tsc 类型检查 + vite build
-npm run tauri:build   # 构建桌面安装包（产物在 src-tauri/target/release/bundle/）
+npm run tauri:build   # 构建桌面安装包（Windows 产物在 src-tauri/target/release/）
 ```
+
+macOS 打包 `.app` + `.dmg`（Apple Silicon）：
+
+```bash
+npx tauri build --config src-tauri/tauri.macos.conf.json
+# 产物：src-tauri/target/release/bundle/macos/x-hub.app 与 bundle/dmg/x-hub_<版本>_aarch64.dmg
+```
+
+## 🖥️ 跨平台支持
+
+x-hub 0.9.0 起**双平台支持**：Windows（x64）与 macOS（Apple Silicon），功能集完全对齐——
+工作台 / 速记 / 待办 / 速达 / 剪贴板历史 / AI 助手（含 Agent）/ 扩展系统 / 悬浮球 / 通知 / 自动更新
+全部可用，界面与交互一致。
+
+平台层按「公共逻辑 + 平台实现」分层（如剪贴板拆为 `clipboard.rs` + `clipboard/clipboard_win.rs` + `clipboard/clipboard_mac.rs`），
+双平台共享同一套业务语义与数据格式（SQLite 库可跨平台互拷）。
+
+| 能力 | Windows | macOS |
+| --- | --- | --- |
+| 剪贴板监听 | Win32 事件驱动 | NSPasteboard changeCount 轮询（约 400ms） |
+| 粘贴回填 | SendInput 注入 Ctrl+V | CGEvent 注入 ⌘V（需「辅助功能」权限，见下） |
+| 已运行应用前台调度 | Win32 窗口枚举 + 前台锁定绕行 | NSRunningApplication activate |
+| 图标提取 | exe/.lnk 原生 256×256 | .app 的 icns 解包 / NSWorkspace |
+| 开机自启 | 注册表 Run 键 | LaunchAgents |
+| 备注加密 | DPAPI（用户作用域） | AES-256-GCM + 用户锚点主密钥 |
+| 自更新 | exe 两步 rename 自替换 | .app 整包替换（两步 rename） |
+| 扩展 Node 运行时 | node win-x64.zip | node darwin-arm64.tar.gz |
+
+**macOS 使用提示**：
+
+- 全局快捷键采用 Mac 习惯默认值：`⌘⇧Space` 主窗、`⌘⌥V` 剪贴板、`⌘K` 搜索、`⌘⇧K` AI 对话、`⌘⇧N` 速记（均可在设置改键）
+- 剪贴板「粘贴回填」需在 **系统设置 → 隐私与安全性 → 辅助功能** 中允许 x-hub；未授权时自动降级为「仅写入剪贴板」，不影响其余功能
+- 数据根默认 `~/Library/Application Support/x-hub`（与 Windows 同结构，备份可互恢复；「备注」密文与 API Key 一样绑定本机账户，跨机器迁移后按空值处理）
+- 拖拽导入支持 .app、可执行文件与 Finder 替身；「打开文件所在位置」走 Finder 高亮选中（`open -R`）
 
 ## 📂 目录结构
 
@@ -134,7 +170,7 @@ src-tauri/src/
 ├── countdown_ticker.rs / countdown_window.rs  # 倒计时后台驱动 + 圆形浮窗
 ├── floating_ball.rs         # 桌面悬浮球（贴边/滑出/环形菜单）
 ├── notify.rs                # 右下角自绘通知窗（跨 Win10/11，前端 NoticeOverlay.vue 渲染卡片）
-├── clipboard.rs             # 剪贴板监听与历史 + 粘贴注入
+├── clipboard.rs             # 剪贴板监听与历史 + 粘贴注入（公共层；平台实现见 clipboard/clipboard_win.rs 与 clipboard_mac.rs）
 ├── shortcut.rs / tray.rs    # 全局快捷键（5 个）/ 系统托盘
 ├── sysmon.rs                # 系统资源监视（CPU/内存）
 └── repo/                    # 数据访问层（资源/笔记/待办/便签/提示词/倒计时/对话/剪贴板/标签…）
@@ -142,7 +178,7 @@ src-tauri/src/
 
 ## 🔒 数据与隐私
 
-数据统一存放在「数据根」目录下（标准版默认为 `%APPDATA%\x-hub`，可经设置改到任意目录；便携版为 `exe\data`）：
+数据统一存放在「数据根」目录下（Windows 标准版默认为 `%APPDATA%\x-hub`，macOS 为 `~/Library/Application Support/x-hub`，均可经设置改到任意目录；Windows 便携版为 `exe\data`）：
 
 - **数据库**：`数据根\app.db`（SQLite，20+ 张表：速达资源与小类/分区、笔记与文件夹/双链、待办与标签、便签、提示词、倒计时、AI 对话、剪贴板历史等）
 - **图标**：`数据根\icons\`（拖拽导入/扫描安装应用时自动提取的程序图标）

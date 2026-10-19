@@ -23,7 +23,7 @@ tauri-build = { version = "2.6.3", features = [] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.11.3", features = ["protocol-asset", "tray-icon", "unstable"] }
+tauri = { version = "2.11.3", features = ["protocol-asset", "tray-icon", "unstable", "macos-private-api"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-log = "2"
 tauri-plugin-global-shortcut = "2"
@@ -51,6 +51,8 @@ sysinfo = "0.32"
 # 剪贴板 BMP 快照导出转 PNG + 图标导入 .ico 解码（ico 内部复用 bmp/png 管线），避免拖入全家桶；
 # jpeg/webp/gif 是笔记内嵌图片的合法格式，复制笔记图片上剪贴板时需解码重编码成 PNG
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "ico", "jpeg", "webp", "gif"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.52"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -68,9 +70,6 @@ windows-sys = { version = "0.61", features = [
 # 类型同源可 cast（ICoreWebView2_19::SetMemoryUsageTargetLevel）
 webview2-com = "0.38.2"
 windows-core = "0.61"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-winreg = "0.52"
 # 防火墙规则改走 COM（service.rs::firewall_com，INetFwPolicy2）：不再 spawn netsh.exe——
 # 开机自启/关机退出时控制台子系统未就绪，netsh 会以 0xC0000142 弹系统错误框
 windows = { version = "0.61", features = [
@@ -84,6 +83,39 @@ windows = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_NetworkManagement_WindowsFirewall",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# macOS 透明窗口（悬浮球/倒计时水罐/便签浮窗/通知窗都依赖 transparent(true)）：
+# macos-private-api feature 已提升到通用 tauri 依赖（非 mac 平台为 no-op），
+# 配合 tauri.conf.json 的 app.macOSPrivateApi（build 脚本两侧校验必须同时开）。
+# 平台层：NSPasteboard（剪贴板）、NSRunningApplication（前台调度）、
+# NSWorkspace（图标/默认浏览器）、LaunchAgents（自启动）都走 objc2 系绑定
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "NSString",
+    "NSURL",
+    "NSProcessInfo",
+    "NSDistributedNotificationCenter",
+    "NSArray",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSNull",
+    "NSData",
+    "std",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSWorkspace",
+    "NSImage",
+    "NSBitmapImageRep",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSRunningApplication",
+    "NSApplication",
+    "NSWindow",
+    "NSScreen",
+] }
+# 备注落盘加密（secret.rs，macOS 分支）：AES-256-GCM，主密钥存用户目录外锚点
+aes-gcm = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

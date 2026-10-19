@@ -252,9 +252,15 @@ fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     crate::market::version_cmp(a, b)
 }
 
-/// 解析平台条目：取 `windows-x86_64`；便携版优先 portableUrl。
+/// 更新清单的平台条目键：Windows 与 macOS 各取各的键
+#[cfg(target_os = "windows")]
+const PLATFORM_KEY: &str = "windows-x86_64";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM_KEY: &str = "darwin-aarch64";
+
+/// 解析平台条目：取当前平台的键；Windows 便携版优先 portableUrl。
 fn platform_entry(manifest: &UpdateManifest) -> Option<(PlatformEntry, bool)> {
-    let entry = manifest.platforms.get("windows-x86_64")?;
+    let entry = manifest.platforms.get(PLATFORM_KEY)?;
     let portable = crate::paths::is_portable();
     let available = if portable {
         !entry.portable_url.is_empty()
@@ -746,6 +752,207 @@ fn read_pending() -> Option<PendingUpdate> {
 /// 另外每次进入先清理上次升级残留的 .old（此刻已无进程占用，可安全删）。
 /// 拉起走 `relaunch_app`（先释放 single-instance 互斥，见其注释）。
 pub fn apply_pending_update(app: &tauri::AppHandle, current_version: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        apply_pending_update_macos(app, current_version);
+        return;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        apply_pending_update_inner(app, current_version);
+    }
+}
+
+/// macOS 版应用待更新：与 Windows 的「exe 两步 rename」不同，macOS 产物是
+/// `.app` 包——替换必须整包换（Info.plist / Resources / 图标都在包内），
+/// 只换单个二进制会破坏包完整性。流程：
+/// 1. 解包 zip 找到新 `.app` 包（locate_new_bundle）
+/// 2. 当前 `.app` → `<名>.app.old-<pid>`（macOS 允许改名运行中的包，inode 存活）
+/// 3. 新 `.app` → 原路径（跨卷 rename 失败时复制兜底）
+/// 4. 以**原路径**（此刻已是新二进制）拉起新进程并退出
+///    ——不能用 current_exe()：内核会把运行中进程的路径记成 .old 名，按它拉起
+///    的仍是旧版（对应 Windows 注释里「点了重启还是旧版」的坑）。
+/// 失败任一步回滚（.old 还原）。残留 .old 在下次启动开头清理（同 Windows 口径）。
+#[cfg(target_os = "macos")]
+fn apply_pending_update_macos(app: &tauri::AppHandle, current_version: &str) {
+    // 清理历史升级残留的 .old 包（此刻无进程占用）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().and_then(|d| d.parent()).and_then(|d| d.parent()) {
+            // dir = Contents 的父目录（.app 所在处）
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.ends_with(".old") || name.contains(".old-") {
+                        if name.ends_with(".app.old") || name.contains(".app.old-") {
+                            let _ = std::fs::remove_dir_all(e.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let Some(pending) = read_pending() else {
+        return;
+    };
+    if version_cmp(&pending.version, current_version) != std::cmp::Ordering::Greater {
+        log::info!(
+            "待应用更新 v{} 不高于当前版本 v{}，清理过期更新包",
+            pending.version,
+            current_version
+        );
+        discard_pending(&pending);
+        return;
+    }
+    let zip_path = PathBuf::from(&pending.zip_path);
+    if !zip_path.is_file() {
+        log::warn!("待应用更新包不存在（{}），清理标记", zip_path.display());
+        discard_pending(&pending);
+        return;
+    }
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("无法定位当前可执行文件（{e}），跳过本次应用更新");
+            return;
+        }
+    };
+    // exe 在 <bundle>.app/Contents/MacOS/ 下：向上两级是 .app 包根
+    let Some(bundle) = exe_path
+        .parent()
+        .and_then(|macos| macos.parent())
+        .map(|contents| contents.to_path_buf())
+        .filter(|p| p.file_name().map(|n| n.to_string_lossy().ends_with(".app")).unwrap_or(false))
+    else {
+        log::warn!("当前可执行文件不在 .app 包内（开发模式？），跳过自更新");
+        return;
+    };
+    let Some(install_dir) = bundle.parent() else {
+        return;
+    };
+
+    // 解包到暂存目录
+    let version_dir = match updates_root() {
+        Ok(d) => d.join(&pending.version),
+        Err(_) => return,
+    };
+    let staging = version_dir.join(".staging");
+    let staging_tmp = version_dir.join(".staging.tmp");
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&staging_tmp);
+    if let Err(e) = crate::market::extract_zip_read(&zip_path, &staging_tmp) {
+        log::warn!("更新包解包失败（{}），跳过本次应用更新，稍后重试", e);
+        let _ = std::fs::remove_dir_all(&staging_tmp);
+        return;
+    }
+    let Some(new_bundle) = locate_new_bundle(&staging_tmp) else {
+        log::warn!("更新包内未找到 .app 包，跳过应用更新");
+        let _ = std::fs::remove_dir_all(&staging_tmp);
+        return;
+    };
+    if let Err(e) = std::fs::rename(&staging_tmp, &staging) {
+        log::warn!("更新暂存目录就位失败（{e}），跳过本次应用更新");
+        let _ = std::fs::remove_dir_all(&staging_tmp);
+        return;
+    }
+    let new_in_staging = staging.join(
+        new_bundle
+            .strip_prefix(&staging_tmp)
+            .unwrap_or_else(|_| std::path::Path::new(new_bundle.file_name().unwrap_or_default())),
+    );
+
+    // 整包两步替换
+    let old_bundle = install_dir.join(format!(
+        "{}.old-{pid}",
+        bundle.file_name().unwrap_or_default().to_string_lossy(),
+        pid = std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&old_bundle);
+    if let Err(e) = std::fs::rename(&bundle, &old_bundle) {
+        log::warn!("备份当前 .app 失败（{e}），跳过本次应用更新");
+        let _ = std::fs::remove_dir_all(&staging);
+        return;
+    }
+    if let Err(e) = move_dir(&new_in_staging, &bundle) {
+        log::error!("安装新版本失败（{e}），回滚到旧版本");
+        let _ = std::fs::rename(&old_bundle, &bundle);
+        let _ = std::fs::remove_dir_all(&staging);
+        return;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_file(&zip_path);
+    let _ = remove_pending_file();
+    log::info!("应用已自替换升级到 v{}", pending.version);
+
+    // 以原路径拉起新进程（此刻该路径已是新版本二进制）
+    relaunch_app_with(app, &exe_path, false);
+}
+
+/// 在解包目录（根或一层）里找 `.app` 包目录
+#[cfg(target_os = "macos")]
+fn locate_new_bundle(dir: &Path) -> Option<PathBuf> {
+    let is_app = |p: &Path| {
+        p.is_dir()
+            && p.file_name()
+                .map(|n| n.to_string_lossy().ends_with(".app"))
+                .unwrap_or(false)
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if is_app(&p) {
+                return Some(p);
+            }
+            if p.is_dir() {
+                if let Ok(inner) = std::fs::read_dir(&p) {
+                    for ie in inner.flatten() {
+                        if is_app(&ie.path()) {
+                            return Some(ie.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 跨卷安全移动目录：同卷 rename；跨卷退化为递归复制
+#[cfg(target_os = "macos")]
+fn move_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => copy_dir_recursive(src, dst).map_err(|copy_err| {
+            log::warn!("rename 失败（{rename_err}），复制兜底也失败（{copy_err}）");
+            copy_err
+        }),
+    }
+}
+
+/// 递归复制目录（含符号链接按链接复制）
+#[cfg(target_os = "macos")]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let s = entry.path();
+        let d = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&s)?;
+            let _ = std::fs::remove_file(&d);
+            std::os::unix::fs::symlink(&target, &d)?;
+        } else if ft.is_dir() {
+            copy_dir_recursive(&s, &d)?;
+        } else {
+            std::fs::copy(&s, &d)?;
+        }
+    }
+    Ok(())
+}
+
+/// 非 macOS 的原版 apply 流程（exe 两步 rename）
+#[cfg(not(target_os = "macos"))]
+fn apply_pending_update_inner(app: &tauri::AppHandle, current_version: &str) {
     // 清理上次自替换残留的 .old：升级时运行中进程的镜像被改名成了
     // exe.old，Windows 不允许删除运行中进程的镜像文件，当时必删失败；
     // 等到下一次启动它已无进程占用，这里统一清掉，避免 exe 目录长期躺着 .old
@@ -899,6 +1106,16 @@ pub fn apply_pending_update(app: &tauri::AppHandle, current_version: &str) {
 ///   窗口」，两者都没了之后再手动开一个实例不会被拦截——出现双实例（明确不接受）。
 ///   所以失败路径绝不触碰 destroy，本进程仍是受保护的唯一主实例。
 pub fn relaunch_app(app: &tauri::AppHandle, strip_hidden_arg: bool) {
+    let Ok(exe) = std::env::current_exe() else {
+        log::error!("重启失败：无法定位当前 exe");
+        return;
+    };
+    relaunch_app_with(app, &exe, strip_hidden_arg);
+}
+
+/// `relaunch_app` 的显式路径版：macOS 整包自替换后 current_exe() 会指向
+/// 已改名的旧包（内核按路径记忆），必须用替换前记录的原路径拉新进程。
+pub fn relaunch_app_with(app: &tauri::AppHandle, exe: &Path, strip_hidden_arg: bool) {
     // 重启前补一次窗口几何保存：relaunch 走 std::process::exit(0) 硬退，不触发
     // CloseRequested（此前唯一的保存时机）——长期驻留副屏、从不点 × 的用户，
     // config 里存的还是很久以前的坐标，升级/重启后窗口被恢复回老位置（主屏）。
@@ -911,10 +1128,6 @@ pub fn relaunch_app(app: &tauri::AppHandle, strip_hidden_arg: bool) {
     if app.try_state::<crate::service::ServiceState>().is_some() {
         crate::service::stop_all(app);
     }
-    let Ok(exe) = std::env::current_exe() else {
-        log::error!("重启失败：无法定位当前 exe");
-        return;
-    };
     // 当前进程的启动参数原样带给新进程；strip_hidden_arg 时剥掉自启动静默参数
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if strip_hidden_arg {
@@ -924,10 +1137,7 @@ pub fn relaunch_app(app: &tauri::AppHandle, strip_hidden_arg: bool) {
             log::info!("重启已剥掉自启动静默参数，新进程将直接显示主窗口");
         }
     }
-    match std::process::Command::new(&exe)
-        .args(&args)
-        .spawn()
-    {
+    match std::process::Command::new(exe).args(&args).spawn() {
         Ok(_) => {
             // 子进程已创建：此刻释放互斥与隐藏窗口（幂等），保证新实例的
             // CreateMutexW 拿到的是全新互斥、必然成为主实例；随后本进程退出。

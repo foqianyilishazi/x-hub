@@ -59,7 +59,21 @@ fn builtin_node_exe(app: &tauri::AppHandle) -> Option<PathBuf> {
     exe.is_file().then_some(exe)
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+/// macOS（Apple Silicon）：node-<ver>-darwin-arm64.tar.gz → bin/node
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn builtin_node_exe(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = builtin_node_dir(app).ok()?;
+    let exe = dir
+        .join(format!("node-{NODE_VERSION}-darwin-arm64"))
+        .join("bin")
+        .join("node");
+    exe.is_file().then_some(exe)
+}
+
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 fn builtin_node_exe(_app: &tauri::AppHandle) -> Option<PathBuf> {
     None
 }
@@ -90,7 +104,51 @@ async fn download_builtin_node(app: &tauri::AppHandle) -> Result<PathBuf, String
     Ok(exe)
 }
 
-#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+/// 下载并解压内置 Node（macOS arm64）：官方 darwin-arm64 tar.gz，系统 tar 解包。
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+async fn download_builtin_node(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let url = format!(
+        "https://nodejs.org/dist/{NODE_VERSION}/node-{NODE_VERSION}-darwin-arm64.tar.gz"
+    );
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("下载失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载失败: HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+
+    let dir = builtin_node_dir(app)?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 先落盘 tar.gz 再交给系统 tar（bsdtar，macOS 内置）解包
+    let tar_path = dir.join(format!("node-{NODE_VERSION}-darwin-arm64.tar.gz"));
+    std::fs::write(&tar_path, &bytes).map_err(|e| e.to_string())?;
+    let mut cmd = std::process::Command::new("tar");
+    cmd.arg("-xzf").arg(&tar_path).arg("-C").arg(&dir);
+    cmd.no_console_window();
+    let status = cmd
+        .status()
+        .map_err(|e| format!("解压失败: {e}"))?;
+    let _ = std::fs::remove_file(&tar_path);
+    if !status.success() {
+        return Err("解压失败: tar 退出非零".to_string());
+    }
+
+    let exe = dir
+        .join(format!("node-{NODE_VERSION}-darwin-arm64"))
+        .join("bin")
+        .join("node");
+    if !exe.is_file() {
+        return Err("解压后未找到 node".to_string());
+    }
+    log::info!("内置 Node 运行时已就绪: {}", exe.display());
+    Ok(exe)
+}
+
+#[cfg(not(any(
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 async fn download_builtin_node(_app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Err("当前平台暂不支持内置运行时下载，请安装 Node.js".to_string())
 }

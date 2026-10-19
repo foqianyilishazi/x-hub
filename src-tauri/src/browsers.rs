@@ -60,7 +60,97 @@ pub fn list_installed() -> Vec<InstalledBrowser> {
     result
 }
 
-#[cfg(not(target_os = "windows"))]
+/// macOS：扫常见应用目录下的已知浏览器 .app 包（包名白名单，避免把任意
+/// Chromium 壳应用都当浏览器）。展示名取 Info.plist 的 CFBundleName 兜底包名，
+/// exe 字段是 .app 包路径（打开走 `open -a`，见 process::open_with_browser）。
+#[cfg(target_os = "macos")]
+pub fn list_installed() -> Vec<InstalledBrowser> {
+    // (包名, 展示名兜底)
+    const KNOWN: [(&str, &str); 12] = [
+        ("Safari", "Safari"),
+        ("Google Chrome", "Google Chrome"),
+        ("Microsoft Edge", "Microsoft Edge"),
+        ("Firefox.app", "Firefox"),
+        ("Firefox Developer Edition.app", "Firefox Developer Edition"),
+        ("Arc.app", "Arc"),
+        ("Brave Browser", "Brave"),
+        ("Chromium.app", "Chromium"),
+        ("Opera.app", "Opera"),
+        ("Vivaldi.app", "Vivaldi"),
+        ("DuckDuckGo.app", "DuckDuckGo"),
+        ("Orion.app", "Orion"),
+    ];
+    let mut dirs: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("/Applications"),
+        std::path::PathBuf::from("/System/Applications"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    let mut result: Vec<InstalledBrowser> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(bundle_name) = name.strip_suffix(".app") else {
+                continue;
+            };
+            let Some((_, fallback)) = KNOWN.iter().find(|(n, _)| *n == bundle_name) else {
+                continue;
+            };
+            let path = e.path();
+            if !path.join("Contents/MacOS").is_dir() {
+                continue;
+            }
+            let display = bundle_display_name(&path).unwrap_or_else(|| fallback.to_string());
+            if result.iter().any(|b| b.exe == path.to_string_lossy()) {
+                continue;
+            }
+            result.push(InstalledBrowser {
+                name: display,
+                exe: path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    result.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    result
+}
+
+/// Info.plist 的 CFBundleName / CFBundleDisplayName（缺失返回 None，用白名单兜底名）
+#[cfg(target_os = "macos")]
+pub(crate) fn bundle_display_name(bundle: &std::path::Path) -> Option<String> {
+    let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
+    for key in ["CFBundleDisplayName", "CFBundleName"] {
+        let mut lines = plist.lines().map(str::trim);
+        while let Some(line) = lines.next() {
+            if line == format!("<key>{key}</key>") {
+                if let Some(next) = lines.next() {
+                    if let Some(v) = next
+                        .strip_prefix("<string>")
+                        .and_then(|s| s.strip_suffix("</string>"))
+                    {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            return Some(v.to_string());
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// 扫描已安装应用（commands::scan_app_candidates_mac）复用的展示名读取
+#[cfg(target_os = "macos")]
+pub(crate) fn bundle_display_name_for_scan(bundle: &std::path::Path) -> Option<String> {
+    bundle_display_name(bundle)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn list_installed() -> Vec<InstalledBrowser> {
     Vec::new()
 }

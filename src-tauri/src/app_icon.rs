@@ -261,7 +261,147 @@ pub fn icon_png_padded(path: &std::path::Path) -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+// ---------- macOS：NSWorkspace 图标 → PNG ----------
+
+/// 提取任意路径的图标为 PNG 字节（macOS）：
+/// - `.app` 包：Info.plist 的 CFBundleIconFile 指向的 .icns，iconutil 解包后取最大帧
+/// - 普通文件/文件夹：NSWorkspace iconForFile 的位图表示
+/// 前端按 PNG 渲染，失败返回 None 由调用方回退名称首字母。
+#[cfg(target_os = "macos")]
+pub fn extract_icon_png(path: &str) -> Option<Vec<u8>> {
+    let p = std::path::Path::new(path);
+    if p.is_dir() && path.ends_with(".app") {
+        if let Some(png) = app_bundle_icon_png(p) {
+            return Some(png);
+        }
+    }
+    workspace_icon_png(p)
+}
+
+/// .app 包图标：Info.plist → CFBundleIconFile → Resources/<name>.icns → iconutil 解包取最大 PNG
+#[cfg(target_os = "macos")]
+fn app_bundle_icon_png(bundle: &std::path::Path) -> Option<Vec<u8>> {
+    // 读 Info.plist 找 CFBundleIconFile（简单文本扫描足够：plist 是 XML，
+    // 键值成对出现在 <key>xxx</key><string>yyy</string> 相邻行）
+    let plist = std::fs::read_to_string(bundle.join("Contents/Info.plist")).ok()?;
+    let mut icon_name: Option<String> = None;
+    let mut lines = plist.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line == "<key>CFBundleIconFile</key>" {
+            if let Some(next) = lines.next() {
+                if let Some(v) = next
+                    .strip_prefix("<string>")
+                    .and_then(|s| s.strip_suffix("</string>"))
+                {
+                    icon_name = Some(v.trim().to_string());
+                }
+            }
+            break;
+        }
+    }
+    let icon_name = icon_name?;
+    let resources = bundle.join("Contents/Resources");
+    // CFBundleIconFile 可带可不带 .icns 扩展名
+    let icns = if icon_name.ends_with(".icns") {
+        resources.join(&icon_name)
+    } else {
+        resources.join(format!("{icon_name}.icns"))
+    };
+    // 兜底：名字不带扩展名但实际是 iconname.icns 之外的文件（罕见），扫 Resources 下同名任意扩展
+    let icns = if icns.is_file() {
+        icns
+    } else {
+        let mut found = None;
+        if let Ok(entries) = std::fs::read_dir(&resources) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with(&icon_name) && name.ends_with(".icns") {
+                    found = Some(e.path());
+                    break;
+                }
+            }
+        }
+        found?
+    };
+    icns_to_png_largest(&icns)
+}
+
+/// icns → 最大帧 PNG：iconutil 解包成 iconset 目录，按文件名里的像素档挑最大
+#[cfg(target_os = "macos")]
+fn icns_to_png_largest(icns: &std::path::Path) -> Option<Vec<u8>> {
+    use crate::process::NoConsoleWindow;
+
+    let tmp = std::env::temp_dir().join(format!("xhub-icon-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).ok()?;
+    let icns_copy = tmp.join("app.icns");
+    std::fs::copy(icns, &icns_copy).ok()?;
+    let mut cmd = std::process::Command::new("iconutil");
+    cmd.arg("-c").arg("iconset").arg(&icns_copy).current_dir(&tmp);
+    cmd.no_console_window();
+    let status = cmd.status().ok()?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return None;
+    }
+    let iconset = tmp.join("app.iconset");
+    // 文件名形如 icon_32x32.png / icon_256x256@2x.png（@2x 实际像素是 512）
+    let mut best: Option<(u32, std::path::PathBuf)> = None;
+    if let Ok(entries) = std::fs::read_dir(&iconset) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(size_part) = name.strip_prefix("icon_") else {
+                continue;
+            };
+            let Some(size_part) = size_part.strip_suffix(".png") else {
+                continue;
+            };
+            let (dims, retina) = match size_part.split_once('x') {
+                Some((a, b)) => (a, b.ends_with("@2x")),
+                None => continue,
+            };
+            let Ok(base) = dims.parse::<u32>() else {
+                continue;
+            };
+            let px = if retina { base * 2 } else { base };
+            if best.as_ref().map(|(s, _)| px > *s).unwrap_or(true) {
+                best = Some((px, e.path()));
+            }
+        }
+    }
+    let png = best.map(|(_, p)| p).and_then(|p| std::fs::read(p).ok());
+    let _ = std::fs::remove_dir_all(&tmp);
+    png
+}
+
+/// NSWorkspace.iconForFile → 位图表示 → PNG（普通文件/文件夹/兜底）
+#[cfg(target_os = "macos")]
+fn workspace_icon_png(path: &std::path::Path) -> Option<Vec<u8>> {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSBitmapImageRep, NSImage, NSWorkspace};
+    use objc2_foundation::{NSDictionary, NSString};
+
+    let ws = unsafe { NSWorkspace::sharedWorkspace() };
+    let ns_path = NSString::from_str(&path.to_string_lossy());
+    let icon: Retained<NSImage> = unsafe { ws.iconForFile(&ns_path) };
+    // 遍历 representations 找位图（可能是 PDF/ICNS 表示，位图才能直转 PNG）；
+    // 尺寸取 128（网格渲染够用，且与 Windows 链路 256 产物尺寸量级一致）
+    let reps = unsafe { icon.representations() };
+    for rep in reps.iter() {
+        if let Some(bmp) = (unsafe { rep.downcast::<NSBitmapImageRep>() }).ok() {
+            let png = unsafe {
+                bmp.representationUsingType_properties(
+                    objc2_app_kit::NSBitmapImageFileType::PNG,
+                    &NSDictionary::new(),
+                )
+            }?;
+            return Some(png.to_vec());
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn extract_icon_png(_path: &str) -> Option<Vec<u8>> {
     None
 }

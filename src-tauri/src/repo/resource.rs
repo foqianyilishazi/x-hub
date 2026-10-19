@@ -381,7 +381,11 @@ mod tests {
         let raw: String = conn
             .query_row("SELECT remark FROM resources WHERE id = ?1", params![r.id], |row| row.get(0))
             .unwrap();
-        assert!(raw.starts_with("dp1:"), "落盘值应为 DPAPI 密文: {raw}");
+        #[cfg(target_os = "windows")]
+        let prefix = "dp1:";
+        #[cfg(not(target_os = "windows"))]
+        let prefix = "mac1:";
+        assert!(raw.starts_with(prefix), "落盘值应为密文: {raw}");
         assert!(!raw.contains("p@ss"));
     }
 

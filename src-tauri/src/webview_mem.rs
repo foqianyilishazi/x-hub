@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+#[cfg(target_os = "windows")]
 use tauri::Manager;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
