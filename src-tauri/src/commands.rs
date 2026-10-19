@@ -2622,39 +2622,40 @@ pub struct DroppedAppInfo {
 /// 均尝试提取程序图标
 #[tauri::command]
 pub fn parse_dropped_path(path: String) -> Result<DroppedAppInfo, String> {
+    #[cfg(not(target_os = "macos"))]
     let p = std::path::Path::new(&path);
+    #[cfg(not(target_os = "macos"))]
     let ext = p
         .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_lowercase())
         .unwrap_or_default();
-    let (name, target, icon) = if cfg!(target_os = "macos") {
-        parse_dropped_mac(&path)?
-    } else {
-        match ext.as_str() {
-            "exe" => {
-                let name = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("本地应用")
-                    .to_string();
-                let target = path.clone();
-                let icon = extract_app_icon(&target);
-                (name, target, icon)
-            }
-            "lnk" => {
-                let name = p
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("快捷方式")
-                    .to_string();
-                let (target, icon) = resolve_lnk_target_and_icon(&path)?;
-                (name, target, icon)
-            }
-            _ => {
-                log::warn!("拖入文件不支持: {}", path);
-                return Err("仅支持 .exe 文件或 .lnk 快捷方式".into());
-            }
+    #[cfg(target_os = "macos")]
+    let (name, target, icon) = parse_dropped_mac(&path)?;
+    #[cfg(not(target_os = "macos"))]
+    let (name, target, icon) = match ext.as_str() {
+        "exe" => {
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("本地应用")
+                .to_string();
+            let target = path.clone();
+            let icon = extract_app_icon(&target);
+            (name, target, icon)
+        }
+        "lnk" => {
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("快捷方式")
+                .to_string();
+            let (target, icon) = resolve_lnk_target_and_icon(&path)?;
+            (name, target, icon)
+        }
+        _ => {
+            log::warn!("拖入文件不支持: {}", path);
+            return Err("仅支持 .exe 文件或 .lnk 快捷方式".into());
         }
     };
     log::info!("拖入解析成功: {} -> {} (图标: {})", name, target, if icon.is_some() { "有" } else { "无" });

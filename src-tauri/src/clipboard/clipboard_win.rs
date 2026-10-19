@@ -4,7 +4,7 @@
 
 use super::{ClipboardPayload, ImageFormat};
 use std::sync::Mutex;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use windows_sys::Win32::Foundation::{GlobalFree, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
