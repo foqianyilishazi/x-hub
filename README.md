@@ -11,7 +11,7 @@
 ![Rust](https://img.shields.io/badge/Rust-1.77+-dea584?logo=rust&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-local-003b57?logo=sqlite&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20(Apple%20Silicon)-lightgrey)
-![Version](https://img.shields.io/badge/version-0.9.0-blue)
+![Version](https://img.shields.io/badge/version-0.9.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 </div>
@@ -115,7 +115,7 @@ npx tauri build --config src-tauri/tauri.macos.conf.json
 
 ## 🖥️ 跨平台支持
 
-x-hub 0.9.0 起**双平台支持**：Windows（x64）与 macOS（Apple Silicon），功能集完全对齐——
+x-hub v0.9.1 起**双平台支持**：Windows（x64）与 macOS（Apple Silicon），功能集完全对齐——
 工作台 / 速记 / 待办 / 速达 / 剪贴板历史 / AI 助手（含 Agent）/ 扩展系统 / 悬浮球 / 通知 / 自动更新
 全部可用，界面与交互一致。
 
